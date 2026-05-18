@@ -1,0 +1,114 @@
+name: Merge EPG
+
+on:
+  # Run automatically every day at 03:00 UTC
+  schedule:
+    - cron: "0 3 * * *"
+
+  # Allow manual triggering with optional overrides
+  workflow_dispatch:
+    inputs:
+      m3u_url:
+        description: "M3U URL (leave blank to use the M3U_URL secret)"
+        required: false
+        default: ""
+      impersonate:
+        description: "Browser fingerprint (chrome / safari / safari_ios / chrome136 …)"
+        required: false
+        default: "chrome"
+
+  # Also trigger when the script or workflow file is updated
+  push:
+    paths:
+      - "scripts/epg.py"
+      - ".github/workflows/epg.yml"
+
+jobs:
+  merge-epg:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # required to commit the merged result back to the repo
+
+    steps:
+      # ── 1. Checkout ───────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Python setup ───────────────────────────────────────────────────
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+          cache: pip
+
+      # ── 3. Install dependencies ───────────────────────────────────────────
+      # curl-cffi (PyPI name uses a hyphen; imported as curl_cffi) links libcurl
+      # against BoringSSL to replicate Chrome JA3/JA4/HTTP2 fingerprints —
+      # the lightest option for bypassing Cloudflare Bot Management without a
+      # real browser. v0.15+ adds HTTP/3 fingerprint support.
+      # Python >=3.10 is required since v0.14.
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # ── 4. Run the merger ─────────────────────────────────────────────────
+      - name: Run EPG merger
+        env:
+          M3U_URL: ${{ inputs.m3u_url || secrets.M3U_URL }}
+          OUTPUT_PATH: output/merged_epg.xml.gz
+          MAX_WORKERS: "6"
+          REQUEST_TIMEOUT: "60"
+          IMPERSONATE: ${{ inputs.impersonate || 'chrome' }}
+
+          # Optional: Cloudflare Workers reverse proxy
+          # If curl_cffi alone is still blocked (e.g. CF JS Challenge is on),
+          # deploy cloudflare-worker/proxy.js and store the Worker URL as a secret:
+          #   CF_PROXY_URL = https://epg-proxy.your-name.workers.dev/proxy
+          # The script will route all requests through the Worker, which runs
+          # on CF edge nodes and is never blocked by CF itself.
+          CF_PROXY_URL: ${{ secrets.CF_PROXY_URL }}
+
+        run: python scripts/epg.py
+
+      # ── 5. Upload artifact ────────────────────────────────────────────────
+      - name: Upload merged EPG as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: merged-epg-${{ github.run_number }}
+          path: output/merged_epg.xml.gz
+          retention-days: 30
+
+      # ── 6. Commit result to repository ───────────────────────────────────
+      # - name: Commit merged EPG
+      #   run: |
+      #     git config user.name  "github-actions[bot]"
+      #     git config user.email "github-actions[bot]@users.noreply.github.com"
+      #     git add output/merged_epg.xml.gz
+      #     if git diff --cached --quiet; then
+      #       echo "No changes detected, skipping commit"
+      #     else
+      #       TIMESTAMP=$(date -u '+%Y-%m-%d %H:%M UTC')
+      #       git commit -m "chore: update merged EPG [${TIMESTAMP}]"
+      #       git push
+      #     fi
+
+      # ── 7. publish as a Release asset ───────────────────────────
+      # expose the merged EPG at a stable, permanent URL:
+      #   https://github.com/iwinstar/epg_merge_filter/releases/latest/download/merged_epg.xml.gz
+      - name: Delete previous latest release
+        uses: dev-drprasad/delete-tag-and-release@v1.1
+        with:
+          tag_name: latest
+          delete_release: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true   # safe to fail on first run when no release exists
+
+      - name: Publish Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: "Merged EPG"
+          files: output/merged_epg.xml.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
