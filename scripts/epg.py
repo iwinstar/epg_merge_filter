@@ -30,15 +30,18 @@ import os
 import re
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 from urllib.parse import quote
 from xml.etree import ElementTree as ET
 
 # curl_cffi: mimics real browser TLS/HTTP2 fingerprints to bypass Cloudflare
 try:
     from curl_cffi import requests as cf_requests
+
     HAS_CURL_CFFI = True
 except ImportError:
     import requests as cf_requests  # fallback; may be blocked by Cloudflare
+
     HAS_CURL_CFFI = False
 
 # ---------------------------------------------------------------------------
@@ -51,16 +54,18 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-M3U_URL         = os.environ.get("M3U_URL", "")
-OUTPUT_PATH     = os.environ.get("OUTPUT_PATH", "output/merged_epg.xml.gz")
-MAX_WORKERS     = int(os.environ.get("MAX_WORKERS", "6"))
+M3U_URL = os.environ.get("M3U_URL", "")
+OUTPUT_PATH = os.environ.get("OUTPUT_PATH", "output/merged_epg.xml.gz")
+MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "6"))
 REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "30"))
-CF_PROXY_URL    = os.environ.get("CF_PROXY_URL", "").rstrip("/")
-IMPERSONATE     = os.environ.get("IMPERSONATE", "chrome")
+CF_PROXY_URL = os.environ.get("CF_PROXY_URL", "").rstrip("/")
+IMPERSONATE = os.environ.get("IMPERSONATE", "chrome")
+RELEASE_LOG = os.environ.get("RELEASE_LOG", "output/release_notes.md")
 
 # ---------------------------------------------------------------------------
 # HTTP helpers
 # ---------------------------------------------------------------------------
+
 
 def _proxied(url: str) -> str:
     """Wrap the target URL through the Workers reverse proxy if configured."""
@@ -82,7 +87,9 @@ def fetch_bytes(url: str) -> bytes:
     if HAS_CURL_CFFI:
         resp = cf_requests.get(target, impersonate=IMPERSONATE, **kwargs)
     else:
-        log.warning("curl_cffi not installed; falling back to requests (may be blocked by Cloudflare)")
+        log.warning(
+            "curl_cffi not installed; falling back to requests (may be blocked by Cloudflare)"
+        )
         resp = cf_requests.get(
             target,
             headers={
@@ -116,6 +123,7 @@ def fetch_text(url: str) -> str:
 # M3U parsing
 # ---------------------------------------------------------------------------
 
+
 def parse_m3u(text: str) -> tuple[list[str], set[str]]:
     """
     Parse M3U text and return:
@@ -125,32 +133,68 @@ def parse_m3u(text: str) -> tuple[list[str], set[str]]:
     epg_urls: list[str] = []
     tvg_ids: set[str] = set()
     seen_urls: set[str] = set()
+    tvg_names: list[str] = []
+    tvg_ids_duplicate: list[str] = []
+    tvg_id_count = 0
 
     for line in text.splitlines():
         line = line.strip()
 
         # EPG URLs may appear in url-tvg or x-tvg-url attributes,
         # and may be comma-separated lists
-        for attr in ("url-tvg", "x-tvg-url"):
-            m = re.search(rf'{attr}="([^"]*)"', line, re.IGNORECASE)
-            if m:
-                for raw in m.group(1).split(","):
-                    url = raw.strip()
-                    if url and url not in seen_urls:
-                        epg_urls.append(url)
-                        seen_urls.add(url)
+        if line.startswith("##"):
+            for attr in ("url-tvg", "x-tvg-url"):
+                m = re.search(rf'{attr}="([^"]*)"', line, re.IGNORECASE)
+                if m:
+                    for raw in m.group(1).split(","):
+                        url = raw.strip()
+                        if url and url not in seen_urls:
+                            epg_urls.append(url)
+                            seen_urls.add(url)
 
         m = re.search(r'tvg-id="([^"]*)"', line, re.IGNORECASE)
         if m:
+            tvg_id_count = tvg_id_count + 1
             tid = m.group(1).strip()
             if tid:
-                tvg_ids.add(tid)
-        else:
-            m = re.search(r'tvg-name="([^"]*)"', line, re.IGNORECASE)
-            if m:
-                tid = m.group(1).strip()
-                if tid:
+                if tid in tvg_ids:
+                    tvg_ids_duplicate.append(tid)
+                else:
                     tvg_ids.add(tid)
+            else:
+                m = re.search(r'tvg-name="([^"]*)"', line, re.IGNORECASE)
+                if m:
+                    tname = m.group(1).strip()
+                    if tname:
+                        tvg_names.append(tname)
+
+    channel_summary = [
+        "## Channels",
+        "### Summary",
+        "| Total | Invalid | Duplicated | Unique |",
+        "|--------|--------|--------|------:|",
+        f"| {tvg_id_count} | {len(tvg_names)} | {len(tvg_ids_duplicate)} | {len(tvg_ids)} |",
+    ]
+
+    release_note("\n".join(channel_summary))
+
+    if tvg_names:
+        release_note(f"### Invalid IDs ({len(tvg_names)})")
+        release_note("> Entries where `tvg-id` is empty or whitespace-only.")
+        for tvg_name in sorted(tvg_names):
+            release_note(f"- {tvg_name}")
+
+    if tvg_ids_duplicate:
+        release_note(f"### Duplicated IDs ({len(tvg_ids_duplicate)})")
+        release_note(
+            "> The same `tvg-id` appears on more than one M3U entry. First occurrence is kept."
+        )
+        for tvg_id in sorted(tvg_ids_duplicate):
+            release_note(f"- {tvg_id}")
+
+    log.info(
+        f"Found {len(epg_urls)} EPG source(s), {tvg_id_count} tvg-id(s), {len(tvg_names)} invalid tvg-id(s), {len(tvg_ids_duplicate)} duplicated tvg-id(s), {len(tvg_ids)} unique tvg-id(s)"
+    )
 
     return epg_urls, tvg_ids
 
@@ -159,19 +203,20 @@ def parse_m3u(text: str) -> tuple[list[str], set[str]]:
 # EPG download & merge
 # ---------------------------------------------------------------------------
 
+
 def download_epg(url: str) -> ET.Element | None:
     """Download and parse a single EPG XML; returns the root <tv> element."""
     try:
         log.info(f"Downloading EPG: {url}")
         data = fetch_bytes(url)
         root = ET.fromstring(data)
-        log.info(
-            f"  OK {url} — "
-            f"channels: {len(root.findall('channel'))}  "
-            f"programmes: {len(root.findall('programme'))}"
-        )
+        channels = len(root.findall("channel"))
+        programmes = len(root.findall("programme"))
+        release_note(f"| {url} | OK | {channels} | {programmes} |")
+        log.info(f"  OK {url} — channels: {channels}  programmes: {programmes}")
         return root
     except Exception as exc:
+        release_note(f"| {url} | {exc} | - | - |")
         log.warning(f"  FAILED [{url}]: {exc}")
         return None
 
@@ -211,10 +256,21 @@ def merge_epg(roots: list[ET.Element], tvg_ids: set[str]) -> ET.Element:
     )
 
     unmatched = tvg_ids - seen_channels
+
+    merge_summary = [
+        "## Merge Result",
+        "### Summary",
+        "| Channels | Unmatched | Matched | Programmes |",
+        "|--------|--------|--------|------:|",
+        f"| {len(tvg_ids)} | {len(unmatched)} | {len(seen_channels)} | {total_prog} |",
+    ]
+    release_note("\n".join(merge_summary))
+
     if unmatched:
-        log.warning(f"{len(unmatched)} tvg-id(s) not found in any EPG source:")
+        release_note(f"### Unmatched IDs ({len(unmatched)})")
+        release_note("> Entries where `tvg-id` not found in any EPG source")
         for uid in sorted(unmatched):
-            log.warning(f"  - {uid}")
+            release_note(f"- {uid}")
 
     return merged
 
@@ -222,6 +278,7 @@ def merge_epg(roots: list[ET.Element], tvg_ids: set[str]) -> ET.Element:
 # ---------------------------------------------------------------------------
 # Output
 # ---------------------------------------------------------------------------
+
 
 def write_xml(root: ET.Element, path: str) -> None:
     """
@@ -246,14 +303,41 @@ def write_xml(root: ET.Element, path: str) -> None:
         gz.write(xml_bytes)
 
     raw_kb = len(xml_bytes) / 1024
-    gz_kb  = os.path.getsize(path) / 1024
-    ratio  = (1 - gz_kb / raw_kb) * 100 if raw_kb else 0
-    log.info(f"Written to {path} ({gz_kb:.1f} KB compressed, {raw_kb:.1f} KB raw, {ratio:.0f}% reduction)")
+    gz_kb = os.path.getsize(path) / 1024
+    ratio = (1 - gz_kb / raw_kb) * 100 if raw_kb else 0
+    log.info(
+        f"Written to {path} ({gz_kb:.1f} KB compressed, {raw_kb:.1f} KB raw, {ratio:.0f}% reduction)"
+    )
+
+    file_path = Path(path)
+    file_summary = [
+        "### File Summary",
+        "| Name | Raw Size | Compressed Size | Reduction |",
+        "|--------|--------|--------|------:|",
+        f"| {file_path.name} | {raw_kb:.1f} KB | {gz_kb:.1f} KB | {ratio:.0f}% |",
+    ]
+    release_note("\n".join(file_summary))
+
+
+# ---------------------------------------------------------------------------
+# Record release notes
+# ---------------------------------------------------------------------------
+
+
+def release_note(content: str, path: str = RELEASE_LOG):
+    file_path = Path(path)
+    if file_path.suffix != ".md":
+        file_path = file_path.with_suffix(".md")
+
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    with file_path.open("a", encoding="utf-8") as f:
+        f.write(content + "\n")
 
 
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
+
 
 def main() -> int:
     if not M3U_URL:
@@ -266,11 +350,18 @@ def main() -> int:
     log.info(f"Fetching M3U: {M3U_URL}")
     m3u_text = fetch_text(M3U_URL)
     epg_urls, tvg_ids = parse_m3u(m3u_text)
-    log.info(f"Found {len(epg_urls)} EPG source(s), {len(tvg_ids)} unique tvg-id(s)")
 
     if not epg_urls:
         log.error("No EPG URLs found in M3U (url-tvg / x-tvg-url)")
         return 1
+
+    epg_source_summary = [
+        "## EPG Sources",
+        f"### Summary ({len(epg_urls)})",
+        "| URL | Status | Channels | Programmes |",
+        "|--------|--------|--------|------:|",
+    ]
+    release_note("\n".join(epg_source_summary))
 
     roots: list[ET.Element] = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:

@@ -2,8 +2,8 @@ name: Merge EPG
 
 on:
   # Run automatically every day at 03:00 UTC
-  schedule:
-    - cron: "0 3 * * *"
+  # schedule:
+  #   - cron: "17,47 * * * *"
 
   # Allow manual triggering with optional overrides
   workflow_dispatch:
@@ -27,12 +27,12 @@ jobs:
   merge-epg:
     runs-on: ubuntu-latest
     permissions:
-      contents: write   # required to commit the merged result back to the repo
+      contents: write # required to commit the merged result back to the repo
 
     steps:
       # ── 1. Checkout ───────────────────────────────────────────────────────
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       # ── 2. Python setup ───────────────────────────────────────────────────
       - name: Set up Python
@@ -67,15 +67,17 @@ jobs:
           # on CF edge nodes and is never blocked by CF itself.
           CF_PROXY_URL: ${{ secrets.CF_PROXY_URL }}
 
-        run: python scripts/epg.py
+        run: |
+          echo "MERGE_TIME=$(TZ='Asia/Shanghai' date +"%Y-%m-%dT%H:%M:%S%z")" >> $GITHUB_ENV
+          python scripts/epg.py
 
       # ── 5. Upload artifact ────────────────────────────────────────────────
-      - name: Upload merged EPG as artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: merged-epg-${{ github.run_number }}
-          path: output/merged_epg.xml.gz
-          retention-days: 30
+      # - name: Upload merged EPG as artifact
+      #   uses: actions/upload-artifact@v7
+      #   with:
+      #     name: merged-epg-${{ github.run_number }}
+      #     path: output/merged_epg.xml.gz
+      #     retention-days: 30
 
       # ── 6. Commit result to repository ───────────────────────────────────
       # - name: Commit merged EPG
@@ -94,21 +96,10 @@ jobs:
       # ── 7. publish as a Release asset ───────────────────────────
       # expose the merged EPG at a stable, permanent URL:
       #   https://github.com/iwinstar/epg_merge_filter/releases/latest/download/merged_epg.xml.gz
-      - name: Delete previous latest release
-        uses: dev-drprasad/delete-tag-and-release@v1.1
-        with:
-          tag_name: latest
-          delete_release: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        continue-on-error: true   # safe to fail on first run when no release exists
-
       - name: Publish Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: latest
-          name: "Merged EPG"
+          name: Merged EPG @ ${{ env.MERGE_TIME }}
+          body_path: output/release_notes.md
           files: output/merged_epg.xml.gz
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
