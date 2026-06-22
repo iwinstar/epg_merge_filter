@@ -85,7 +85,14 @@ def fetch_bytes(url: str) -> bytes:
     kwargs = dict(timeout=REQUEST_TIMEOUT)
 
     if HAS_CURL_CFFI:
-        resp = cf_requests.get(target, impersonate=IMPERSONATE, **kwargs)
+        resp = cf_requests.get(target, 
+            headers={
+                "User-Agent": "AptvPlayer/1.5.4",
+                "Accept": "*/*",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Connection": "keep-alive",
+            },
+            impersonate=IMPERSONATE, **kwargs)
     else:
         log.warning(
             "curl_cffi not installed; falling back to requests (may be blocked by Cloudflare)"
