@@ -23,13 +23,17 @@ Environment variables:
                       edge146    safari17_0
 """
 
+from __future__ import annotations
+
 import gzip
-import io
 import logging
 import os
 import re
 import sys
+import tempfile
+from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import quote
 from xml.etree import ElementTree as ET
@@ -40,8 +44,10 @@ try:
 
     HAS_CURL_CFFI = True
 except ImportError:
-    import requests as cf_requests  # fallback; may be blocked by Cloudflare
-
+    try:
+        import requests as cf_requests  # fallback; may be blocked by Cloudflare
+    except ImportError:
+        cf_requests = None
     HAS_CURL_CFFI = False
 
 # ---------------------------------------------------------------------------
@@ -84,6 +90,9 @@ def fetch_bytes(url: str) -> bytes:
     target = _proxied(url)
     kwargs = dict(timeout=REQUEST_TIMEOUT)
 
+    if cf_requests is None:
+        raise RuntimeError("Install curl_cffi or requests to fetch remote EPG sources")
+
     if HAS_CURL_CFFI:
         resp = cf_requests.get(target, 
             headers={
@@ -118,6 +127,45 @@ def fetch_bytes(url: str) -> bytes:
     return data
 
 
+def fetch_to_file(url: str) -> Path:
+    """Download a URL to a temporary file without buffering the body in memory."""
+    target = _proxied(url)
+    kwargs = dict(timeout=REQUEST_TIMEOUT)
+
+    if cf_requests is None:
+        raise RuntimeError("Install curl_cffi or requests to fetch remote EPG sources")
+
+    headers = {
+        "User-Agent": "AptvPlayer/1.5.4",
+        "Accept": "*/*",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+    }
+
+    if HAS_CURL_CFFI:
+        resp = cf_requests.get(
+            target, headers=headers, impersonate=IMPERSONATE, stream=True, **kwargs
+        )
+    else:
+        log.warning(
+            "curl_cffi not installed; falling back to requests (may be blocked by Cloudflare)"
+        )
+        resp = cf_requests.get(target, headers=headers, stream=True, **kwargs)
+
+    resp.raise_for_status()
+
+    with tempfile.NamedTemporaryFile(prefix="epg_", suffix=".xml", delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+        if hasattr(resp, "iter_content"):
+            for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    tmp.write(chunk)
+        else:
+            tmp.write(resp.content)
+
+    return tmp_path
+
+
 def fetch_text(url: str) -> str:
     data = fetch_bytes(url)
     try:
@@ -150,7 +198,7 @@ def parse_m3u(text: str) -> tuple[list[str], set[str]]:
         # EPG URLs may appear in url-tvg or x-tvg-url attributes,
         # and may be comma-separated lists
         if line.startswith("##"):
-            for attr in ("url-tvg", "x-tvg-url"):
+            for attr in ("url-tvg", "x-tvg-url", "x-gary-epg-url"):
                 m = re.search(rf'{attr}="([^"]*)"', line, re.IGNORECASE)
                 if m:
                     for raw in m.group(1).split(","):
@@ -211,21 +259,121 @@ def parse_m3u(text: str) -> tuple[list[str], set[str]]:
 # ---------------------------------------------------------------------------
 
 
-def download_epg(url: str) -> ET.Element | None:
-    """Download and parse a single EPG XML; returns the root <tv> element."""
+@dataclass
+class EpgDownloadResult:
+    url: str
+    root: ET.Element | None = None
+    channels: int = 0
+    programmes: int = 0
+    error: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.root is not None
+
+
+def is_gzip_file(path: Path) -> bool:
+    with path.open("rb") as f:
+        return f.read(2) == b"\x1f\x8b"
+
+
+def parse_epg_file(path: Path, url: str, tvg_ids: set[str]) -> EpgDownloadResult:
+    """Stream-parse one XMLTV file and keep only relevant channel/programme nodes."""
+    filtered = ET.Element("tv")
+    channels = 0
+    programmes = 0
+    source_root: ET.Element | None = None
+
+    input_file = gzip.open(path, "rb") if is_gzip_file(path) else path.open("rb")
+    with input_file as source:
+        for event, elem in ET.iterparse(source, events=("start", "end")):
+            if event == "start" and source_root is None:
+                source_root = elem
+                for attr, val in elem.attrib.items():
+                    filtered.set(attr, val)
+                continue
+
+            if event != "end":
+                continue
+
+            if elem.tag == "channel":
+                channels += 1
+                cid = elem.get("id", "").strip()
+                if cid in tvg_ids:
+                    filtered.append(deepcopy(elem))
+                elem.clear()
+                if source_root is not None:
+                    source_root.clear()
+            elif elem.tag == "programme":
+                programmes += 1
+                channel = elem.get("channel", "").strip()
+                if channel in tvg_ids:
+                    filtered.append(deepcopy(elem))
+                elem.clear()
+                if source_root is not None:
+                    source_root.clear()
+
+    return EpgDownloadResult(url, filtered, channels, programmes)
+
+
+def download_epg(url: str, tvg_ids: set[str]) -> EpgDownloadResult:
+    """Download and stream-parse a single EPG XML."""
+    tmp_path: Path | None = None
     try:
         log.info(f"Downloading EPG: {url}")
-        data = fetch_bytes(url)
-        root = ET.fromstring(data)
-        channels = len(root.findall("channel"))
-        programmes = len(root.findall("programme"))
-        release_note(f"| {url} | OK | {channels} | {programmes} |")
-        log.info(f"  OK {url} — channels: {channels}  programmes: {programmes}")
-        return root
+        tmp_path = fetch_to_file(url)
+        result = parse_epg_file(tmp_path, url, tvg_ids)
+        log.info(
+            f"  OK {url} — channels: {result.channels}  programmes: {result.programmes}"
+        )
+        return result
     except Exception as exc:
-        release_note(f"| {url} | {exc} | - | - |")
         log.warning(f"  FAILED [{url}]: {exc}")
-        return None
+        return EpgDownloadResult(url, error=str(exc))
+    finally:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+
+
+def write_epg_source_notes(results: list[EpgDownloadResult]) -> None:
+    ok_count = sum(1 for result in results if result.ok)
+    epg_source_summary = [
+        "## EPG Sources",
+        f"### Summary ({ok_count}/{len(results)} OK)",
+        "| URL | Status | Channels | Programmes |",
+        "|--------|--------|--------|------:|",
+    ]
+    release_note("\n".join(epg_source_summary))
+
+    for result in results:
+        if result.ok:
+            release_note(
+                f"| {result.url} | OK | {result.channels} | {result.programmes} |"
+            )
+        else:
+            release_note(f"| {result.url} | {result.error} | - | - |")
+
+
+def programme_key(prog: ET.Element) -> tuple[str, str, str] | tuple[str, str]:
+    channel = prog.get("channel", "").strip()
+    start = prog.get("start", "").strip()
+    stop = prog.get("stop", "").strip()
+    if channel and start:
+        return channel, start, stop
+    return channel, ET.tostring(prog, encoding="unicode")
+
+
+class CountingWriter:
+    def __init__(self, wrapped):
+        self.wrapped = wrapped
+        self.bytes_written = 0
+
+    def write(self, data: bytes) -> int:
+        self.bytes_written += len(data)
+        return self.wrapped.write(data)
+
+    def flush(self) -> None:
+        self.wrapped.flush()
 
 
 def merge_epg(roots: list[ET.Element], tvg_ids: set[str]) -> ET.Element:
@@ -238,7 +386,10 @@ def merge_epg(roots: list[ET.Element], tvg_ids: set[str]) -> ET.Element:
     merged.set("generator-info-name", "epg-merger")
 
     seen_channels: set[str] = set()
+    seen_programmes: set[tuple[str, str, str] | tuple[str, str]] = set()
+    programme_channels: set[str] = set()
     total_prog = 0
+    duplicate_prog = 0
 
     for root in roots:
         # Carry over root-level attributes from the first source that defines them
@@ -253,23 +404,33 @@ def merge_epg(roots: list[ET.Element], tvg_ids: set[str]) -> ET.Element:
                 seen_channels.add(cid)
 
         for prog in root.findall("programme"):
-            if prog.get("channel", "").strip() in tvg_ids:
-                merged.append(prog)
-                total_prog += 1
+            if prog.get("channel", "").strip() not in tvg_ids:
+                continue
+
+            key = programme_key(prog)
+            if key in seen_programmes:
+                duplicate_prog += 1
+                continue
+
+            merged.append(prog)
+            seen_programmes.add(key)
+            programme_channels.add(prog.get("channel", "").strip())
+            total_prog += 1
 
     log.info(
         f"Merge complete — channels kept: {len(seen_channels)}/{len(tvg_ids)}, "
-        f"programme entries: {total_prog}"
+        f"programme entries: {total_prog}, duplicate programmes skipped: {duplicate_prog}"
     )
 
     unmatched = tvg_ids - seen_channels
+    channels_without_programmes = seen_channels - programme_channels
 
     merge_summary = [
         "## Merge Result",
         "### Summary",
-        "| Channels | Unmatched | Matched | Programmes |",
-        "|--------|--------|--------|------:|",
-        f"| {len(tvg_ids)} | {len(unmatched)} | {len(seen_channels)} | {total_prog} |",
+        "| Channels | Unmatched | Matched | No Programme | Programmes | Duplicated Programmes |",
+        "|--------|--------|--------|--------|--------|------:|",
+        f"| {len(tvg_ids)} | {len(unmatched)} | {len(seen_channels)} | {len(channels_without_programmes)} | {total_prog} | {duplicate_prog} |",
     ]
     release_note("\n".join(merge_summary))
 
@@ -278,6 +439,14 @@ def merge_epg(roots: list[ET.Element], tvg_ids: set[str]) -> ET.Element:
         release_note("> Entries where `tvg-id` not found in any EPG source")
         for uid in sorted(unmatched):
             release_note(f"- {uid}")
+
+    if channels_without_programmes:
+        release_note(
+            f"### Channels Without Programmes ({len(channels_without_programmes)})"
+        )
+        release_note("> Matched `<channel>` entries that have no merged `<programme>`.")
+        for cid in sorted(channels_without_programmes):
+            release_note(f"- {cid}")
 
     return merged
 
@@ -296,20 +465,15 @@ def write_xml(root: ET.Element, path: str) -> None:
         path = path + ".gz"
 
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    ET.indent(root, space="  ")
     tree = ET.ElementTree(root)
 
-    # Serialize to an in-memory buffer first, then compress to disk
-    buf = io.BytesIO()
-    buf.write(b'<?xml version="1.0" encoding="UTF-8"?>\n')
-    buf.write(b'<!DOCTYPE tv SYSTEM "xmltv.dtd">\n')
-    tree.write(buf, encoding="utf-8", xml_declaration=False)
-    xml_bytes = buf.getvalue()
-
     with gzip.open(path, "wb", compresslevel=9) as gz:
-        gz.write(xml_bytes)
+        counter = CountingWriter(gz)
+        counter.write(b'<?xml version="1.0" encoding="UTF-8"?>\n')
+        counter.write(b'<!DOCTYPE tv SYSTEM "xmltv.dtd">\n')
+        tree.write(counter, encoding="utf-8", xml_declaration=False)
 
-    raw_kb = len(xml_bytes) / 1024
+    raw_kb = counter.bytes_written / 1024
     gz_kb = os.path.getsize(path) / 1024
     ratio = (1 - gz_kb / raw_kb) * 100 if raw_kb else 0
     log.info(
@@ -362,21 +526,17 @@ def main() -> int:
         log.error("No EPG URLs found in M3U (url-tvg / x-tvg-url)")
         return 1
 
-    epg_source_summary = [
-        "## EPG Sources",
-        f"### Summary ({len(epg_urls)})",
-        "| URL | Status | Channels | Programmes |",
-        "|--------|--------|--------|------:|",
-    ]
-    release_note("\n".join(epg_source_summary))
-
-    roots: list[ET.Element] = []
+    results_by_url: dict[str, EpgDownloadResult] = {}
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        futures = {pool.submit(download_epg, url): url for url in epg_urls}
+        futures = {pool.submit(download_epg, url, tvg_ids): url for url in epg_urls}
         for fut in as_completed(futures):
-            r = fut.result()
-            if r is not None:
-                roots.append(r)
+            url = futures[fut]
+            results_by_url[url] = fut.result()
+
+    results = [results_by_url[url] for url in epg_urls]
+    write_epg_source_notes(results)
+
+    roots = [result.root for result in results if result.root is not None]
 
     if not roots:
         log.error("All EPG downloads failed")
