@@ -25,18 +25,50 @@ Environment variables:
 
 from __future__ import annotations
 
+import certifi
 import gzip
 import logging
 import os
 import re
 import sys
 import tempfile
+
 from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import quote
 from xml.etree import ElementTree as ET
+
+# root ca for *.samsungcloud.tv
+ROOT_PEM = """-----BEGIN CERTIFICATE-----
+MIIDrzCCApegAwIBAgIQCDvgVpBCRrGhdWrJWZHHSjANBgkqhkiG9w0BAQUFADBh
+MQswCQYDVQQGEwJVUzEVMBMGA1UEChMMRGlnaUNlcnQgSW5jMRkwFwYDVQQLExB3
+d3cuZGlnaWNlcnQuY29tMSAwHgYDVQQDExdEaWdpQ2VydCBHbG9iYWwgUm9vdCBD
+QTAeFw0wNjExMTAwMDAwMDBaFw0zMTExMTAwMDAwMDBaMGExCzAJBgNVBAYTAlVT
+MRUwEwYDVQQKEwxEaWdpQ2VydCBJbmMxGTAXBgNVBAsTEHd3dy5kaWdpY2VydC5j
+b20xIDAeBgNVBAMTF0RpZ2lDZXJ0IEdsb2JhbCBSb290IENBMIIBIjANBgkqhkiG
+9w0BAQEFAAOCAQ8AMIIBCgKCAQEA4jvhEXLeqKTTo1eqUKKPC3eQyaKl7hLOllsB
+CSDMAZOnTjC3U/dDxGkAV53ijSLdhwZAAIEJzs4bg7/fzTtxRuLWZscFs3YnFo97
+nh6Vfe63SKMI2tavegw5BmV/Sl0fvBf4q77uKNd0f3p4mVmFaG5cIzJLv07A6Fpt
+43C/dxC//AH2hdmoRBBYMql1GNXRor5H4idq9Joz+EkIYIvUX7Q6hL+hqkpMfT7P
+T19sdl6gSzeRntwi5m3OFBqOasv+zbMUZBfHWymeMr/y7vrTC0LUq7dBMtoM1O/4
+gdW7jVg/tRvoSSiicNoxBN33shbyTApOB6jtSj1etX+jkMOvJwIDAQABo2MwYTAO
+BgNVHQ8BAf8EBAMCAYYwDwYDVR0TAQH/BAUwAwEB/zAdBgNVHQ4EFgQUA95QNVbR
+TLtm8KPiGxvDl7I90VUwHwYDVR0jBBgwFoAUA95QNVbRTLtm8KPiGxvDl7I90VUw
+DQYJKoZIhvcNAQEFBQADggEBAMucN6pIExIK+t1EnE9SsPTfrgT1eXkIoyQY/Esr
+hMAtudXH/vTBH1jLuG2cenTnmCmrEbXjcKChzUyImZOMkXDiqw8cvpOp/2PV5Adg
+06O/nVsJ8dWO41P0jmP6P6fbtGbfYmbW0W5BjfIttep3Sp+dWOIrWcBAI+0tKIJF
+PnlUkiaY4IBIqDfv8NZ5YBberOgOzW6sRBc4L0na4UU+Krk2U886UAb3LujEV0ls
+YSEY1QSteDwsOoBrp+uvFRTp2InBuThs4pFsiv9kuXclVzDAGySj4dzp30d8tbQk
+CAUw7C29C79Fv1C5qfPrmAESrciIxpg0X40KPMbp1ZWVbd4=
+-----END CERTIFICATE-----"""
+
+BUNDLE_PATH = "/tmp/epg-merge-filter-ca-bundle.pem"
+with open(certifi.where()) as f:
+    base = f.read()
+with open(BUNDLE_PATH, "w") as f:
+    f.write(base + "\n" + ROOT_PEM)
 
 # curl_cffi: mimics real browser TLS/HTTP2 fingerprints to bypass Cloudflare
 try:
@@ -179,11 +211,12 @@ def fetch_text(url: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def parse_m3u(text: str) -> tuple[list[str], set[str]]:
+def parse_m3u(text: str) -> tuple[list[str], set[str], list[tuple[str, str]]]:
     """
     Parse M3U text and return:
-      epg_urls : deduplicated, order-preserving list of EPG XML URLs
-      tvg_ids  : set of all channel tvg-ids
+      epg_urls  : deduplicated, order-preserving list of EPG XML URLs
+      tvg_ids   : set of all channel tvg-ids
+      tvg_logos : list of (display_name, logo_url) for every entry that has a tvg-logo
     """
     epg_urls: list[str] = []
     tvg_ids: set[str] = set()
@@ -191,6 +224,7 @@ def parse_m3u(text: str) -> tuple[list[str], set[str]]:
     tvg_names: list[str] = []
     tvg_ids_duplicate: list[str] = []
     tvg_id_count = 0
+    tvg_logos: list[tuple[str, str]] = []
 
     for line in text.splitlines():
         line = line.strip()
@@ -223,6 +257,19 @@ def parse_m3u(text: str) -> tuple[list[str], set[str]]:
                     if tname:
                         tvg_names.append(tname)
 
+        logo_m = re.search(r'tvg-logo="([^"]*)"', line, re.IGNORECASE)
+        if logo_m:
+            logo_url = logo_m.group(1).strip()
+            if logo_url:
+                name_m = re.search(r'tvg-name="([^"]*)"', line, re.IGNORECASE)
+                display_name = name_m.group(1).strip() if name_m else ""
+                if not display_name:
+                    id_m = re.search(r'tvg-id="([^"]*)"', line, re.IGNORECASE)
+                    display_name = id_m.group(1).strip() if id_m else ""
+                if not display_name:
+                    display_name = line.rsplit(",", 1)[-1].strip()
+                tvg_logos.append((display_name or logo_url, logo_url))
+
     channel_summary = [
         "## Channels",
         "### Summary",
@@ -248,10 +295,82 @@ def parse_m3u(text: str) -> tuple[list[str], set[str]]:
             release_note(f"- {tvg_id}")
 
     log.info(
-        f"Found {len(epg_urls)} EPG source(s), {tvg_id_count} tvg-id(s), {len(tvg_names)} invalid tvg-id(s), {len(tvg_ids_duplicate)} duplicated tvg-id(s), {len(tvg_ids)} unique tvg-id(s)"
+        f"Found {len(epg_urls)} EPG source(s), {tvg_id_count} tvg-id(s), {len(tvg_names)} invalid tvg-id(s), {len(tvg_ids_duplicate)} duplicated tvg-id(s), {len(tvg_ids)} unique tvg-id(s), {len(tvg_logos)} tvg-logo(s)"
     )
 
-    return epg_urls, tvg_ids
+    return epg_urls, tvg_ids, tvg_logos
+
+
+# ---------------------------------------------------------------------------
+# tvg-logo availability check
+# ---------------------------------------------------------------------------
+
+
+def check_logo_url(url: str) -> tuple[bool, str]:
+    target = _proxied(url)
+    headers = {
+        "User-Agent": "AptvPlayer/1.5.4",
+        "Accept": "*/*",
+    }
+    resp = None
+    try:
+        if HAS_CURL_CFFI:
+            resp = cf_requests.get(
+                target,
+                headers=headers,
+                impersonate=IMPERSONATE,
+                timeout=REQUEST_TIMEOUT,
+                verify=BUNDLE_PATH,
+            )
+        else:
+            resp = cf_requests.get(
+                target, headers=headers, timeout=REQUEST_TIMEOUT, verify=BUNDLE_PATH,
+            )
+        status = resp.status_code
+        return status < 400, str(status)
+    except Exception as exc:
+        return False, str(exc)
+    finally:
+        if resp is not None and hasattr(resp, "close"):
+            resp.close()
+
+
+def check_tvg_logos(tvg_logos: list[tuple[str, str]]) -> None:
+    if not tvg_logos:
+        return
+
+    url_to_names: dict[str, list[str]] = {}
+    for name, url in tvg_logos:
+        url_to_names.setdefault(url, []).append(name)
+
+    failed: list[tuple[str, list[str], str]] = []
+    checked = 0
+
+    log.info(f"Checking {len(url_to_names)} tvg-logo URL(s)")
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        futures = {pool.submit(check_logo_url, url): url for url in url_to_names}
+        for fut in as_completed(futures):
+            url = futures[fut]
+            ok, detail = fut.result()
+            checked += 1
+            if not ok:
+                failed.append((url, url_to_names[url], detail))
+                log.warning(f"  FAILED [{url}]: {detail}")
+
+    log.info(f"Logo check complete: {checked - len(failed)}/{checked} OK")
+
+    logo_summary = [
+        "## Logo Check",
+        f"### Summary ({checked - len(failed)}/{checked} OK)",
+    ]
+    release_note("\n".join(logo_summary))
+
+    if failed:
+        release_note(f"### Failed Logos ({len(failed)})")
+        release_note("> Entries where tvg-logo is unavailable.")
+        for url, names, detail in sorted(failed, key=lambda item: item[0]):
+            names_str = ";".join(sorted(set(names)))
+            release_note(f"- {names_str}: {url} ({detail})")
 
 
 # ---------------------------------------------------------------------------
@@ -383,7 +502,11 @@ def merge_epg(roots: list[ET.Element], tvg_ids: set[str]) -> ET.Element:
       <programme channel="X"> kept only when X is in tvg_ids
     """
     merged = ET.Element("tv")
-    merged.set("generator-info-name", "epg-merger")
+    merged.set("generator-info-url", "https://github.com/iwinstar/epg_merge_filter")
+    merged.set("generator-info-name", "epg-merge-filter")
+
+    channel_elems: list[ET.Element] = []
+    programme_elems: list[ET.Element] = []
 
     seen_channels: set[str] = set()
     seen_programmes: set[tuple[str, str, str] | tuple[str, str]] = set()
@@ -400,7 +523,7 @@ def merge_epg(roots: list[ET.Element], tvg_ids: set[str]) -> ET.Element:
         for ch in root.findall("channel"):
             cid = ch.get("id", "").strip()
             if cid in tvg_ids and cid not in seen_channels:
-                merged.append(ch)
+                channel_elems.append(ch)
                 seen_channels.add(cid)
 
         for prog in root.findall("programme"):
@@ -412,10 +535,15 @@ def merge_epg(roots: list[ET.Element], tvg_ids: set[str]) -> ET.Element:
                 duplicate_prog += 1
                 continue
 
-            merged.append(prog)
+            programme_elems.append(prog)
             seen_programmes.add(key)
             programme_channels.add(prog.get("channel", "").strip())
             total_prog += 1
+
+    for ch in channel_elems:
+        merged.append(ch)
+    for prog in programme_elems:
+        merged.append(prog)
 
     log.info(
         f"Merge complete — channels kept: {len(seen_channels)}/{len(tvg_ids)}, "
@@ -452,6 +580,32 @@ def merge_epg(roots: list[ET.Element], tvg_ids: set[str]) -> ET.Element:
 
 
 # ---------------------------------------------------------------------------
+# Icon URL upgrade
+# ---------------------------------------------------------------------------
+
+ICON_URL_REPLACEMENTS: list[tuple[str, str]] = [
+    ("focus.telerama.fr/252x168", "focus.telerama.fr/1764x1176"),
+    ("thumb.canalplus.pro/http/unsafe/256x143", "thumb.canalplus.pro/http/unsafe/1792x1001"),
+    ("thumb.canalplus.pro/http/unsafe/640x360", "thumb.canalplus.pro/http/unsafe/1920x1080")
+]
+
+
+def upgrade_icon_urls(root: ET.Element) -> int:
+    upgraded = 0
+    for icon in root.findall(".//programme/icon"):
+        src = icon.get("src", "")
+        if not src:
+            continue
+        new_src = src
+        for old, new in ICON_URL_REPLACEMENTS:
+            new_src = new_src.replace(old, new)
+        if new_src != src:
+            icon.set("src", new_src)
+            upgraded += 1
+    return upgraded
+
+
+# ---------------------------------------------------------------------------
 # Output
 # ---------------------------------------------------------------------------
 
@@ -465,12 +619,14 @@ def write_xml(root: ET.Element, path: str) -> None:
         path = path + ".gz"
 
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    ET.indent(root, space="  ")
     tree = ET.ElementTree(root)
 
     with gzip.open(path, "wb", compresslevel=9) as gz:
         counter = CountingWriter(gz)
         counter.write(b'<?xml version="1.0" encoding="UTF-8"?>\n')
         counter.write(b'<!DOCTYPE tv SYSTEM "xmltv.dtd">\n')
+        counter.write(b'<!-- Generated with EPG Merge Filter -->\n')
         tree.write(counter, encoding="utf-8", xml_declaration=False)
 
     raw_kb = counter.bytes_written / 1024
@@ -520,7 +676,9 @@ def main() -> int:
 
     log.info(f"Fetching M3U: {M3U_URL}")
     m3u_text = fetch_text(M3U_URL)
-    epg_urls, tvg_ids = parse_m3u(m3u_text)
+    epg_urls, tvg_ids, tvg_logos = parse_m3u(m3u_text)
+
+    check_tvg_logos(tvg_logos)
 
     if not epg_urls:
         log.error("No EPG URLs found in M3U (url-tvg / x-tvg-url)")
@@ -543,6 +701,10 @@ def main() -> int:
         return 1
 
     merged = merge_epg(roots, tvg_ids)
+
+    upgraded = upgrade_icon_urls(merged)
+    log.info(f"Icon URLs upgraded: {upgraded}")
+
     write_xml(merged, OUTPUT_PATH)
     return 0
 
