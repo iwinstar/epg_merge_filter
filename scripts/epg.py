@@ -36,6 +36,7 @@ import tempfile
 from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
 from xml.etree import ElementTree as ET
@@ -502,8 +503,14 @@ def merge_epg(roots: list[ET.Element], tvg_ids: set[str]) -> ET.Element:
       <programme channel="X"> kept only when X is in tvg_ids
     """
     merged = ET.Element("tv")
-    merged.set("generator-info-url", "https://github.com/iwinstar/epg_merge_filter")
+
+    now = datetime.now(timezone.utc)
+    merged.set("date", now.strftime("%Y%m%d%H%M%S %z"))
+    merged.set("source-info-name", "epgshare01")
+    merged.set("source-info-url", "https://epgshare01.online/")
+    merged.set("source-data-url", "https://epgshare01.online/epgshare01/")
     merged.set("generator-info-name", "epg-merge-filter")
+    merged.set("generator-info-url", "https://github.com/iwinstar/epg_merge_filter")
 
     channel_elems: list[ET.Element] = []
     programme_elems: list[ET.Element] = []
@@ -516,13 +523,22 @@ def merge_epg(roots: list[ET.Element], tvg_ids: set[str]) -> ET.Element:
 
     for root in roots:
         # Carry over root-level attributes from the first source that defines them
-        for attr, val in root.attrib.items():
-            if attr not in merged.attrib:
-                merged.set(attr, val)
+        # for attr, val in root.attrib.items():
+        #     if attr not in merged.attrib:
+        #         merged.set(attr, val)
 
         for ch in root.findall("channel"):
             cid = ch.get("id", "").strip()
             if cid in tvg_ids and cid not in seen_channels:
+                seen_icon = set()
+
+                for icon in list(ch.findall("icon")):
+                    src = icon.get("src")
+                    if not src or src in seen_icon:
+                        ch.remove(icon)
+                    else:
+                        seen_icon.add(src)
+
                 channel_elems.append(ch)
                 seen_channels.add(cid)
 
